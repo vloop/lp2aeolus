@@ -78,7 +78,6 @@ def aconnect(from_port, to_port):
     # define __snd_alloca(ptr,type) do { *ptr = (type##_t *) alloca(type##_sizeof()); memset(*ptr, 0, type##_sizeof()); } while (0)
     # size_t snd_seq_port_subscribe_sizeof(void);
     # print(libasound.snd_seq_port_subscribe_sizeof()) # --> 80
-    # What if it was not an exact multiple of 8?
     subs = (c_void_p * int(libasound.snd_seq_port_subscribe_sizeof() / sizeof(c_void_p)))()
     # snd_seq_port_subscribe_alloca(&subs);
 
@@ -93,13 +92,13 @@ def aconnect(from_port, to_port):
     if (libasound.snd_seq_get_port_subscription(seq, subs) == 0):
         libasound.snd_seq_close(seq)
         logging.error("Connection from %s to %s is already subscribed", from_port, to_port)
-        return(1)
+        return(2)
 
     # if (snd_seq_subscribe_port(seq, subs) < 0) {
     if (libasound.snd_seq_subscribe_port(seq, subs) < 0):
         libasound.snd_seq_close(seq)
         logging.error("Connection from %s to %s failed", from_port, to_port)
-        return (1)
+        return(1)
 
     return(0)
 

@@ -7,12 +7,11 @@ import getopt
 import logging
 import time
 
-from rtmidi.midiutil import open_midiport, open_midioutput
+from rtmidi.midiutil import open_midiport, open_midioutput, list_available_ports
 from rtmidi.midiconstants import (NOTE_OFF, NOTE_ON, CONTROL_CHANGE, PROGRAM_CHANGE,
     NRPN_MSB, NRPN_LSB, DATA_ENTRY_MSB, DATA_ENTRY_LSB, END_OF_EXCLUSIVE, SYSTEM_EXCLUSIVE)
 
-from rtmidi import (API_LINUX_ALSA, API_MACOSX_CORE, API_RTMIDI_DUMMY,
-    API_UNIX_JACK, API_WINDOWS_MM, MidiIn, MidiOut, get_compiled_api)
+from rtmidi import (API_LINUX_ALSA, MidiIn, MidiOut, get_compiled_api)
 
 AEOLUS_CC = 98
 MAX_STOPS = 18
@@ -22,20 +21,17 @@ LP_BLUE = 0x2D
 
 
 class MidiInputHandler(object):
-
+    """Process incoming MIDI messages"""
     def __init__(self, in_port, midi_channel_in, out_port, midi_channel_out, out_port2, midi_channel_out2):
         self.in_port = in_port
-        self.out_port = out_port
-        self.out_port2 = out_port2
         self.midi_channel_in = int(midi_channel_in)
+        self.out_port = out_port
         self.midi_channel_out = int(midi_channel_out)
+        self.out_port2 = out_port2
         self.midi_channel_out2 = int(midi_channel_out2)
         self._wallclock = time.time()
         self.in_callback = False
         self.keydown = [False] * 128
-        self.mode_in = None
-        self.group_in = None
-        self.stop_number_in = None
 
     def aeolus_cc_to_note(self, group_in, stop_number):
         y = 1 + 2 * (3 - group_in) + 1 - (stop_number // 9)
@@ -51,92 +47,87 @@ class MidiInputHandler(object):
         print("@%0.6f %r" % (self._wallclock, message))
         self.in_callback = True
         if message[0] == CONTROL_CHANGE + int(self.midi_channel_in):
+            # Les numéros de contrôleur utilisés par les boutons ronds
+            # de la ligne supérieure ne changent pas quel que soit le
+            # mode, c'est toujours de 68h à 6Fh
             if 0x68 <= message[1] <= 0x6F:
-                # These CC come from the launchpad
-                # The  controller numbers  for  the  top  row  of  round  buttons
-                # do not  change  with  layout  and  is always as 68h to 6Fh
-                print('Bouton du dessus', message[1] - 0x68, 'valeur', message[2])
-                self.in_callback = False
-                return
+                print('Launchpad: Bouton du dessus', message[1] - 0x68, 'valeur', message[2])
             elif message[1] == AEOLUS_CC:
-                # This CC comes from Aeolus
-                print("Aeolus:", message[2])
+                # Ce CC provient d'Aeolus
                 if (message[2] & 0x40):
-                    # Mode/group message from Aeolus
+                    # Message mode/groupe d'Aeolus
                     self.mode_in = (message[2] >> 4) & 0x03
                     self.group_in = message[2] & 0x07
-                    print("Mode", self.mode_in, "group", self.group_in)
+                    print("Aeolus: Mode", self.mode_in, "group", self.group_in)
                     if self.mode_in == 0:
-                        # Clear group
+                        # Remise à zéro du groupe
                         self.mode_in = None
-                        print("Clearing group", self.group_in)
+                        print("Désactivation du groupe", self.group_in)
                         for stop_number in range(MAX_STOPS):
                             note = self.aeolus_cc_to_note(self.group_in, stop_number)
                             if self.keydown[note]:
+                                self.keydown[note] = False
                                 self.out_port.send_message([NOTE_ON + self.midi_channel_out, note, LP_BLACK])
                 else:
-                    # Stop number message from Aeolus
+                    # Message de numéro de registre d'Aeolus
                     if self.mode_in is None:
-                        logging.error("Mode was not set")
+                        logging.error("Mode non défini")
                     else:
-                        self.stop_number_in = message[2] & 0x1F
-                        # Now translate mode/group/stop into noteon
-                        # Only handle buttons that fit the launchpad:
-                        # Stop numbers above MAX_STOPS should be ignored
-                        # Groups above MAX_GROUPS should be ignored
-                        if self.stop_number_in < MAX_STOPS and self.group_in < MAX_GROUPS:
-                            note = self.aeolus_cc_to_note(self.group_in, self.stop_number_in)
-                            print("From Aeolus: mode", self.mode_in, "group", self.group_in, "stop number", self.stop_number_in, note)
+                        stop_number_in = message[2] & 0x1F
+                        # Calcul de la note à partir du groupe, du mode et du registre
+                        # Ne pas tenir compte des touches absentes launchpad:
+                        # On ignore le message si le registre dépasse MAX_STOPS
+                        # ou si le groupe dépasse MAX_GROUPS
+                        if stop_number_in < MAX_STOPS and self.group_in < MAX_GROUPS:
+                            note = self.aeolus_cc_to_note(self.group_in, stop_number_in)
+                            print("Aeolus: mode", self.mode_in, "groupe", self.group_in, "registre", stop_number_in, note)
                             if self.mode_in == 0:
-                                # disabled, also resets all elements in the group.
+                                # Rien à faire, désactivation du groupe.
                                 v = None
                             elif self.mode_in == 1:
-                                # set off
+                                # Activation d'un registre
                                 v = False
                             elif self.mode_in == 2:
-                                # set on
+                                # Désactivation d'un registre
                                 v = True
                             else:  # self.mode_in == 3
-                                # toggle
+                                # Inversion de l'état d'un registre
                                 v = not self.keydown[note]
                             if v is not None and v != self.keydown[note]:
                                 self.keydown[note] = v
-                                self.out_port.send_message([NOTE_ON + self.midi_channel_out, note, LP_BLUE if v else LP_BLACK])
-                self.in_callback = False
-                return
+                                color = LP_BLUE if v else LP_BLACK
+                                self.out_port.send_message([NOTE_ON + self.midi_channel_out, note, color])
             else:
                 logging.warning("Contrôleur MIDI inattendu: %s %s %s", message[0], message[1], message[2])
-                self.in_callback = False
-                return
         elif message[0] == NOTE_ON + int(self.midi_channel_in):
-            # Layout 0 is Session layout.
-            # This is best for writing software that uses Launchpad MK2
-            # as a grid as it is easy to navigate by adding and
-            # subtracting - adding 1 moves to the right 1 button,
-            # adding 10 moves up one button.
+            # Le launchpad est exploité en mode session
+            # Ce mode convient bien pour utiliser le launchpad comme une
+            # grille: ajouter un correspond à un déplacement d'une
+            # colonne vers la droite, ajouter 10 correspond à une ligne
+            # vers le haut
             note = message[1]
             y, x = divmod(note, 10)
-            print('Bouton colonne', x, 'ligne', y, 'valeur', message[2])
+            print('Launchpad: Bouton colonne', x, 'ligne', y, 'valeur', message[2])
             if message[2] == 0x7F:
-                # pad pressed, change key state
+                # Appui sur le pad, changement d'état
                 self.keydown[note] = not self.keydown[note]
-                # send to launchpad
-                self.out_port.send_message([NOTE_ON + self.midi_channel_out, note, LP_BLUE if self.keydown[note] else LP_BLACK])
-                # send to Aeolus on output port #2
-                mode = 2 if self.keydown[note] else 1
-                group = (8 - y) // 2  # 2 rows per group starting from top
+                color = 0x2D if self.keydown[note] else 0
+                print("Envoi vers le launchpad:", NOTE_ON + self.midi_channel_out, note, color)
+                self.out_port.send_message([NOTE_ON + self.midi_channel_out, note, color])
+                # Envoi vers Aeolus sur le deuxième port de sortie
+                mode = 2 if self.keydown[note] else 1  # action 2 pour on, 1 pour off
+                group = (8 - y) // 2  # 2 lignes par groupe à partir du haut
                 stop_number = x - 1 + (((8 - y) & 1) * 9)
-                print('Envoi: mode', mode, 'groupe', group, 'registre', stop_number)
-                self.out_port2.send_message([CONTROL_CHANGE + self.midi_channel_out2, AEOLUS_CC, 0x40 + (mode << 4) + group])
-                self.out_port2.send_message([CONTROL_CHANGE + self.midi_channel_out2, AEOLUS_CC, stop_number])
+                print('Envoi vers Aeolus: mode', mode, 'groupe', group, 'registre', stop_number)
+                self.out_port2.send_message([CONTROL_CHANGE + self.midi_channel_out2, 98, 0x40 + (mode << 4) + group])
+                self.out_port2.send_message([CONTROL_CHANGE + self.midi_channel_out2, 98, stop_number])
             else:
-                pass  # Pad released, state doesn't change
-            self.in_callback = False
-            return
+                # Relachement du pad, aucun changement
+                pass
         else:
             logging.warning("Message MIDI inattendu: %s %s %s", message[0], message[1], message[2])
-            self.in_callback = False
-            return
+        self.in_callback = False
+        return
 
 
 class MidiMapper:
@@ -147,26 +138,25 @@ class MidiMapper:
         self.midi_channel_in = midi_channel_in
         self.midi_channel_out = midi_channel_out
         self.midi_channel_out2 = midi_channel_out2
-        self.map_file_name = None
-        # Input handler will require output, initialize MIDI output first
+        # Nous aurons besoin de la sortie depuis l'intérieur du callback
+        # Il faut donc l'initialiser en premier
         try:
             self.midiout, self.port_name_out = open_midiport(port_num_out, 'output', interactive=False)
             logging.info("%s ouvert en sortie", self.port_name_out)
-            # Should switch to session layout (0)
-            # Host >> Launchpad MK2:
-            # F0h 00h 20h 29h 02h 18h 22h <Layout> F7h
-            self.midiout.send_message([0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x22, 0x00, 0xF7])
-            # and clear all leds
         except Exception as e:
             logging.error("Echec d'ouverture en sortie %s", e)
             sys.exit(1)
-        # Create secondary output as a virtual port
+        # Passe le launchpad en mode session
+        self.midiout.send_message([0xF0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x22, 0x00, 0xF7])
+
+        # Creation du deuxième port de sortie en tant que port virtuel
         try:
-            self.midiout2 = open_midioutput(None, client_name='mapper', use_virtual=True)[0]
+            self.midiout2 = open_midioutput(None, client_name='to_aeolus', use_virtual=True)[0]
         except Exception as e:
             logging.error("Echec d'ouverture de la deuxième sortie %s", e)
             sys.exit(1)
-        # Initialize MIDI input
+
+        # Initialisation de l'entrée MIDI
         try:
             self.midiin, self.port_name_in = open_midiport(port_num_in, 'input', interactive=False)
             logging.info("%s ouvert en entrée", self.port_name_in)
@@ -175,14 +165,13 @@ class MidiMapper:
                 self.midiin, self.midi_channel_in,
                 self.midiout, self.midi_channel_out,
                 self.midiout2, self.midi_channel_out2))
-            # self.midiin.cancel_callback()
         except Exception as e:
             logging.error("Echec d'ouverture en entrée %s", e)
             sys.exit(1)
 
 
 def list_midi_ports():
-    # Example: Launchpad MK2:Launchpad MK2 MIDI 1
+    """ Imprime une liste des ports MIDI Alsa"""
     if API_LINUX_ALSA in get_compiled_api():
         print('Input:')
         for p in MidiIn(API_LINUX_ALSA).get_ports():
@@ -190,22 +179,8 @@ def list_midi_ports():
         print('Output:')
         for p in MidiOut(API_LINUX_ALSA).get_ports():
             print(p)
-
-
-def get_midi_port_num_in(s):
-    p_num = 0
-    for p in MidiIn(API_LINUX_ALSA).get_ports():
-        if p.startswith(s):
-            return(p_num)
-        p_num += 1
-
-
-def get_midi_port_num_out(s):
-    p_num = 0
-    for p in MidiOut(API_LINUX_ALSA).get_ports():
-        if p.startswith(s):
-            return(p_num)
-        p_num += 1
+    else:
+        print('Ce programme nécessite Alsa')
 
 
 def main(argv=None):
@@ -216,10 +191,12 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hli:o:c:v", ["help", "list", "input=", "output=", "channel=", "verbose"])
+        opts, args = getopt.getopt(sys.argv[1:],
+            "hli:o:c:v",
+            ["help", "list", "input=", "output=", "channel=", "verbose"])
     except getopt.GetoptError as err:
-        # print help information and exit:
-        print(str(err))  # will print something like "option -a not recognized"
+        # Affiche l'aide et sort
+        print(str(err))  # Imprimera quelque chose comme "option -a not recognized"
         usage()
         sys.exit(2)
 
@@ -244,13 +221,8 @@ def main(argv=None):
         elif o in ("-c", "--channel"):
             channel = a
         else:
-            assert False, "unhandled option"
-    s = 'Launchpad MK2'
-    if input_port is None:
-        input_port = get_midi_port_num_in(s)
-    if output_port is None:
-        output_port = get_midi_port_num_out(s)
-    app = MidiMapper(port_num_in=input_port, port_num_out=output_port, midi_channel_in=channel, midi_channel_out=channel, midi_channel_out2=channel)
+            assert False, "option non reconnue"
+    app = MidiMapper(port_num_in=input_port, port_num_out=output_port, midi_channel_in=channel, midi_channel_out=channel)
     print('En attente de message MIDI')
     try:
         while True:
